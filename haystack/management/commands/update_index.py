@@ -5,10 +5,14 @@ import logging
 import os
 from datetime import timedelta
 from optparse import make_option
+from itertools import islice
 
 from django import db
 from django.core.management.base import LabelCommand
 from django.db import reset_queries
+from django.db import transaction
+
+from djorm_core.postgresql import server_side_cursors
 
 from haystack import connections as haystack_connections
 from haystack.query import SearchQuerySet
@@ -90,6 +94,19 @@ def do_update(backend, index, qs, start, end, total, verbosity=1):
 
     # Clear out the DB connections queries because it bloats up RAM.
     reset_queries()
+
+
+def do_update_batch(backend, index, iteritems, start, batch_size, total, verbosity=1):
+
+    if verbosity >= 2:
+        if hasattr(os, 'getppid') and os.getpid() == os.getppid():
+            print("  indexing %s - %d of %d." % (start + 1, start+batch_size, total))
+        else:
+            print("  indexing %s - %d of %d (by %s)." % (start + 1, start+batch_size, total, os.getpid()))
+
+    batch = list(islice(iteritems,batch_size))
+    backend.update(index, batch)
+    return len(batch)
 
 
 def do_remove(backend, index, model, pks_seen, start, upper_bound, verbosity=1):
@@ -225,20 +242,26 @@ class Command(LabelCommand):
             batch_size = self.batchsize or backend.batch_size
 
             if self.workers > 0:
+                # multi-worker, many-queries
                 ghetto_queue = []
-
-            for start in range(0, total, batch_size):
-                end = min(start + batch_size, total)
-
-                if self.workers == 0:
-                    do_update(backend, index, qs, start, end, total, self.verbosity)
-                else:
+                for start in range(0, total, batch_size):
+                    end = min(start + batch_size, total)
                     ghetto_queue.append(('do_update', model, start, end, total, using, self.start_date, self.end_date, self.verbosity))
-
-            if self.workers > 0:
                 pool = multiprocessing.Pool(self.workers)
                 pool.map(worker, ghetto_queue)
                 pool.terminate()
+            else:
+                # single-query, still-batched
+                start = 0
+                with server_side_cursors():
+                    with transaction.atomic():
+                        items = qs.iterator()  # prevents filling query-cache
+                        while True:
+                            added = do_update_batch(backend, index, items, start, batch_size, total, self.verbosity)
+                            if added > 0:
+                                start += added
+                                continue
+                            break
 
             if self.remove:
                 if self.start_date or self.end_date or total <= 0:
